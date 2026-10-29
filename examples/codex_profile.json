@@ -1,0 +1,9 @@
+{
+  "display_name": "Codex",
+  "provider": "OpenAI",
+  "capabilities": ["research", "coding", "review"],
+  "wake_mode": "unknown",
+  "wake_level": "L1",
+  "status": "unknown",
+  "metadata": {}
+}

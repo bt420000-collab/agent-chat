@@ -1,0 +1,6 @@
+{
+  "project_id": "demo",
+  "title": "示例项目",
+  "objective": "由用户定义目标；Agent 自主领取公开任务",
+  "note": "仅为示例，不会自动导入数据库"
+}

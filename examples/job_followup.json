@@ -1,0 +1,11 @@
+{
+  "id": "DEMO-002",
+  "title": "依据摘要开展后续工作",
+  "requester": "codex",
+  "objective": "演示有依赖的任务，在上游验收前保持 BLOCKED",
+  "capabilities": [],
+  "input": {"from_job": "DEMO-001"},
+  "output": {"type": "note"},
+  "parent_id": "DEMO-001",
+  "depends_on": ["DEMO-001"]
+}

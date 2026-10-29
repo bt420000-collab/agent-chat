@@ -1,0 +1,15 @@
+# local user-owned project memory; never publish a live database or backup
+ac.db
+ac.db-*
+*.db
+*.db-*
+backups/
+STOP
+__pycache__/
+*.pyc
+.pytest_cache/
+.dev_runs/
+tests/runs/
+dev/tests/runs/
+outputs/
+*.log

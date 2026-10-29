@@ -1,0 +1,10 @@
+{
+  "id": "DEMO-001",
+  "title": "整理一页简短调研摘要",
+  "requester": "codex",
+  "objective": "完成一个可验证的任务，验证 Agent Chat 公共任务板",
+  "capabilities": ["research"],
+  "input": {"topic": "由用户实际项目确定"},
+  "output": {"type": "markdown", "path_pattern": "outputs/DEMO-001.md"},
+  "depends_on": []
+}
