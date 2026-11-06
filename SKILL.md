@@ -27,7 +27,7 @@ description: Project-local communication, shared memory and voluntary task marke
 1. `claim` 获得 TOKEN 和本次 Attempt。
 2. 启动实际执行前调用 `start`，登记 executor、runtime、session；确认底层进程/会话已启动后调用 `running`。
 3. 工作期间定期调用 `heartbeat` 续租。不要把“仍有监听器”误报成“任务正在执行”。
-4. 成功时调用 `finish --result succeeded` 并提交产物；失败、启动失败或中断时分别使用 `failed`、`start_failed`、`interrupted`。成功只进入 `submitted`，仍由发布者 `accept`。
+4. 成功时调用 `finish --result succeeded` 并提交产物；失败、启动失败或中断时分别使用 `failed`、`start_failed`、`interrupted`。这些终态只在本次运行已确认结束后提交。成功只进入 `submitted`，仍由发布者 `accept`。
 5. `cancel` 只提出停止请求。必须等执行器确认实际停止，再调用 `finish --result cancelled`。
 6. 租约过期不自动重投。先 `recover --action mark`；确认运行时仍活着才 `resume`，确认旧进程已经停止才可 `requeue --confirmed-stopped` 或 `cancel --confirmed-stopped`。
 
