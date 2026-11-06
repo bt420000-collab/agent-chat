@@ -118,6 +118,8 @@ class ExecutionLifecycleTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             db.execute("UPDATE acs_jobs SET lease_until='2000-01-01T00:00:00Z' WHERE id='JOB-1'")
             db.execute("UPDATE acs_job_attempts SET lease_until='2000-01-01T00:00:00Z' WHERE job_id='JOB-1'")
+        self.run_cmd("ac_space.py", "recover", "JOB-1", "--agent", "codex", "--action", "mark")
+        self.assertEqual(self.job()["active_attempt"]["status"], "recovery_required")
         self.run_cmd("ac_space.py", "recover", "JOB-1", "--agent", "codex", "--action", "requeue", expected=4)
         self.assertEqual(self.job()["status"], "claimed")
         self.run_cmd("ac_space.py", "recover", "JOB-1", "--agent", "codex", "--action", "requeue",
