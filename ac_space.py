@@ -50,6 +50,18 @@ def require_id(value):
     return value
 
 
+def execute_sql_script(db, script):
+    statement = ''
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                db.execute(statement)
+            statement = ''
+    if statement.strip():
+        raise ACError(4, 'incomplete_space_migration')
+
+
 class Space:
     def __init__(self, store):
         self.s = store
@@ -58,6 +70,72 @@ class Space:
                 self.s.db.execute(sql)
             self.s.db.execute("INSERT OR IGNORE INTO acs_meta VALUES('space_version','1')")
             self.s.db.execute("INSERT OR IGNORE INTO acs_meta VALUES('revision','0')")
+        version = int(self.s.db.execute("SELECT value FROM acs_meta WHERE key='space_version'").fetchone()[0])
+        if version == 1:
+            migration = Path(__file__).resolve().parent / 'migrations' / '003_job_execution_lifecycle.sql'
+            with self.s.transaction():
+                current = int(self.s.db.execute("SELECT value FROM acs_meta WHERE key='space_version'").fetchone()[0])
+                if current == 1:
+                    execute_sql_script(self.s.db, migration.read_text(encoding='utf-8'))
+                    self.s.db.execute("UPDATE acs_meta SET value='2' WHERE key='space_version'")
+                    self.s.event('space_schema_migrated', 'agent-chat', from_version=1, to_version=2)
+                elif current != 2:
+                    raise ACError(4, 'unsupported_space_schema_version')
+        elif version != 2:
+            raise ACError(4, 'unsupported_space_schema_version')
+
+    def _get_job(self, jid):
+        row = self.s.db.execute('SELECT * FROM acs_jobs WHERE id=?', (jid,)).fetchone()
+        if row is None:
+            raise ACError(4, 'job_not_found')
+        return row
+
+    def _active_attempt(self, jid):
+        return self.s.db.execute(
+            """SELECT * FROM acs_job_attempts WHERE job_id=?
+               AND status IN ('claimed','starting','running','cancel_requested','recovery_required')
+               ORDER BY attempt_no DESC LIMIT 1""", (jid,)
+        ).fetchone()
+
+    def _attempt_for_claim(self, row, agent, token):
+        if row['status'] != 'claimed' or row['owner'] != agent or row['claim_token'] != token:
+            raise ACError(6, 'stale_or_foreign_claim')
+        attempt = self._active_attempt(row['id'])
+        if attempt is None:
+            # Adopt claims created by the v0.1 task board before execution tracking existed.
+            attempt_no = self.s.db.execute(
+                'SELECT COALESCE(MAX(attempt_no),0)+1 FROM acs_job_attempts WHERE job_id=?',
+                (row['id'],)
+            ).fetchone()[0]
+            attempt_id = uuid.uuid4().hex
+            lease_until = row['lease_until'] or utc()
+            self.s.db.execute(
+                """INSERT INTO acs_job_attempts(
+                   attempt_id,job_id,attempt_no,agent_id,claim_token_hash,status,
+                   executor_id,runtime,created_at,updated_at,heartbeat_at,lease_until,details_json
+                   ) VALUES(?,?,?,?,?,'claimed','legacy','legacy',?,?,?,?,?)""",
+                (attempt_id, row['id'], attempt_no, agent,
+                 hashlib.sha256(token.encode('utf-8')).hexdigest(),
+                 row['updated_at'], utc(), utc(), lease_until, encoded({'adopted_from':'space_v1'}))
+            )
+            self.s.event('space_attempt_adopted', agent, row['id'], attempt_id=attempt_id, legacy=True)
+            attempt = self._active_attempt(row['id'])
+        token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        if attempt is None or attempt['agent_id'] != agent or attempt['claim_token_hash'] != token_hash:
+            raise ACError(6, 'stale_or_foreign_attempt')
+        return attempt
+
+    def _artifact(self, artifact):
+        if not artifact:
+            return None, None
+        path = Path(artifact)
+        if path.is_absolute() or '..' in path.parts:
+            raise ACError(4, 'artifact_must_be_relative')
+        base = self.s.path.parent.resolve()
+        resolved = (base / path).resolve()
+        if not resolved.is_relative_to(base) or not resolved.is_file():
+            raise ACError(4, 'artifact_not_found_or_outside')
+        return str(path), hashlib.sha256(resolved.read_bytes()).hexdigest()
 
     def next_rev(self):
         self.s.db.execute("UPDATE acs_meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'")
@@ -142,40 +220,267 @@ class Space:
         return None
 
     def job(self, jid):
-        r=self.s.db.execute('SELECT * FROM acs_jobs WHERE id=?',(jid,)).fetchone()
-        if not r:raise ACError(4,'job_not_found')
+        r=self._get_job(jid)
         d=dict(r)
-        for k in ('input_json','output_json','capabilities_json'):d[k.removesuffix('_json')]=json.loads(d.pop(k))
+        for k in ('input_json','output_json','capabilities_json'):
+            d[k.removesuffix('_json')]=json.loads(d.pop(k))
         d['depends_on']=[x[0] for x in self.s.db.execute('SELECT depends_on FROM acs_deps WHERE job_id=?',(jid,))]
+        attempts=[]
+        for row in self.s.db.execute('SELECT * FROM acs_job_attempts WHERE job_id=? ORDER BY attempt_no',(jid,)):
+            item=dict(row)
+            item.pop('claim_token_hash',None)
+            item['details']=json.loads(item.pop('details_json'))
+            attempts.append(item)
+        active=next((x for x in reversed(attempts) if x['status'] in
+                     ('claimed','starting','running','cancel_requested','recovery_required')),None)
+        d['attempts']=attempts
+        d['active_attempt']=active
+        d['lease_expired']=bool(active and active.get('lease_until') and active['lease_until']<=utc())
         return d
+
+    def recover(self,jid,actor,action,seconds=3600,confirmed_stopped=False):
+        self.s.require_agent(actor)
+        if action not in ('resume','requeue','cancel'):
+            raise ACError(4,'invalid_recovery_action')
+        if seconds < 1 or seconds > 86400:
+            raise ACError(4,'invalid_lease')
+        if action in ('requeue','cancel') and not confirmed_stopped:
+            raise ACError(4,'recovery_requires_confirmed_stopped')
+        with self.s.transaction():
+            row=self._get_job(jid)
+            if row['status']!='claimed':
+                raise ACError(6,'job_not_claimed')
+            if actor not in (row['requester'],row['owner']):
+                raise ACError(6,'recovery_requires_requester_or_owner')
+            attempt=self._attempt_for_claim(row,row['owner'],row['claim_token'])
+            if attempt['status'] not in ('claimed','starting','running','cancel_requested','recovery_required'):
+                raise ACError(6,'attempt_not_recoverable')
+            lease=attempt['lease_until'] or row['lease_until']
+            if not lease or lease>utc():
+                raise ACError(6,'lease_not_expired')
+            now=utc()
+            if action=='resume':
+                if attempt['status']=='cancel_requested':
+                    raise ACError(6,'cancel_requested_attempt_cannot_resume')
+                new_lease=utc(seconds)
+                self.s.db.execute(
+                    """UPDATE acs_job_attempts SET status='running',started_at=COALESCE(started_at,?),
+                       heartbeat_at=?,lease_until=?,updated_at=? WHERE attempt_id=?""",
+                    (now,now,new_lease,now,attempt['attempt_id'])
+                )
+                self.s.db.execute('UPDATE acs_jobs SET lease_until=?,updated_at=? WHERE id=?',(new_lease,now,jid))
+                self.s.event('space_attempt_recovered',actor,jid,attempt_id=attempt['attempt_id'],
+                             action='resume',lease_seconds=seconds)
+                return 'running'
+            final_state='interrupted' if action=='requeue' else 'cancelled'
+            self.s.db.execute(
+                "UPDATE acs_job_attempts SET status=?,finished_at=?,updated_at=?,error=? WHERE attempt_id=?",
+                (final_state,now,now,'recovered_after_expired_lease',attempt['attempt_id'])
+            )
+            job_state='open' if action=='requeue' else 'cancelled'
+            self.s.db.execute(
+                "UPDATE acs_jobs SET status=?,owner=NULL,claim_token=NULL,lease_until=NULL,updated_at=? WHERE id=?",
+                (job_state,now,jid)
+            )
+            self.s.event('space_attempt_recovered',actor,jid,attempt_id=attempt['attempt_id'],
+                         action=action,confirmed_stopped=True)
+        return job_state
 
     def claim(self,jid,agent,seconds):
         self.s.require_agent(agent)
+        if seconds < 1 or seconds > 86400:
+            raise ACError(4, 'invalid_lease')
         with self.s.transaction():
-            j=self.s.db.execute('SELECT * FROM acs_jobs WHERE id=?',(jid,)).fetchone()
-            if j is None:raise ACError(4,'job_not_found')
-            if j['status']!='open':raise ACError(6,'job_not_open')
+            j=self._get_job(jid)
+            if j['status']!='open':
+                raise ACError(6,'job_not_open')
             token=uuid.uuid4().hex
-            self.s.db.execute("UPDATE acs_jobs SET status='claimed',owner=?,claim_token=?,lease_until=?,updated_at=? WHERE id=? AND status='open'",
-                (agent,token,utc(seconds),utc(),jid))
-            self.s.event('space_job_claimed',agent,jid,lease_seconds=seconds)
+            now=utc()
+            lease_until=utc(seconds)
+            self.s.db.execute(
+                "UPDATE acs_jobs SET status='claimed',owner=?,claim_token=?,lease_until=?,updated_at=? WHERE id=? AND status='open'",
+                (agent,token,lease_until,now,jid)
+            )
+            attempt_no=self.s.db.execute(
+                'SELECT COALESCE(MAX(attempt_no),0)+1 FROM acs_job_attempts WHERE job_id=?',(jid,)
+            ).fetchone()[0]
+            attempt_id=uuid.uuid4().hex
+            self.s.db.execute(
+                """INSERT INTO acs_job_attempts(
+                   attempt_id,job_id,attempt_no,agent_id,claim_token_hash,status,
+                   created_at,updated_at,heartbeat_at,lease_until,details_json
+                   ) VALUES(?,?,?,?,?,'claimed',?,?,?,?,?)""",
+                (attempt_id,jid,attempt_no,agent,hashlib.sha256(token.encode('utf-8')).hexdigest(),
+                 now,now,now,lease_until,encoded({}))
+            )
+            self.s.event('space_job_claimed',agent,jid,attempt_id=attempt_id,attempt_no=attempt_no,lease_seconds=seconds)
         return token
 
-    def submit(self,jid,agent,token,artifact=None):
+    def start(self,jid,agent,token,executor_id='native',runtime='native',session_id=None,pid=None):
         self.s.require_agent(agent)
-        sha=None;artifact_ref=None
-        if artifact:
-            p=Path(artifact)
-            if p.is_absolute() or '..' in p.parts:raise ACError(4,'artifact_must_be_relative')
-            resolved=(self.s.path.parent / p).resolve()
-            if not resolved.is_relative_to(self.s.path.parent.resolve()) or not resolved.is_file():raise ACError(4,'artifact_not_found_or_outside')
-            sha=hashlib.sha256(resolved.read_bytes()).hexdigest();artifact_ref=str(p)
+        if not executor_id.strip() or not runtime.strip():
+            raise ACError(4,'executor_and_runtime_required')
+        if pid is not None and pid < 1:
+            raise ACError(4,'invalid_pid')
         with self.s.transaction():
-            row=self.s.db.execute('SELECT * FROM acs_jobs WHERE id=?',(jid,)).fetchone()
-            if not row or row['owner']!=agent or row['claim_token']!=token or row['status']!='claimed':raise ACError(6,'stale_or_foreign_claim')
-            if row['lease_until'] <= utc():raise ACError(6,'claim_expired_requires_recovery')
-            self.s.db.execute("UPDATE acs_jobs SET status='submitted',artifact=?,sha256=?,updated_at=? WHERE id=?",(artifact_ref,sha,utc(),jid))
-            self.s.event('space_job_submitted',agent,jid,artifact=artifact_ref,sha256=sha)
+            row=self._get_job(jid)
+            attempt=self._attempt_for_claim(row,agent,token)
+            if attempt['status']=='starting' and attempt['executor_id']==executor_id and attempt['runtime']==runtime:
+                return attempt['attempt_id']
+            if attempt['status']!='claimed':
+                raise ACError(6,'attempt_not_claimed')
+            now=utc()
+            self.s.db.execute(
+                """UPDATE acs_job_attempts SET status='starting',executor_id=?,runtime=?,
+                   session_id=?,pid=?,heartbeat_at=?,updated_at=? WHERE attempt_id=?""",
+                (executor_id,runtime,session_id,pid,now,now,attempt['attempt_id'])
+            )
+            self.s.event('space_attempt_starting',agent,jid,attempt_id=attempt['attempt_id'],
+                         executor_id=executor_id,runtime=runtime,session_id=session_id,pid=pid)
+        return attempt['attempt_id']
+
+    def running(self,jid,agent,token,seconds):
+        self.s.require_agent(agent)
+        if seconds < 1 or seconds > 86400:
+            raise ACError(4,'invalid_lease')
+        with self.s.transaction():
+            row=self._get_job(jid)
+            attempt=self._attempt_for_claim(row,agent,token)
+            if attempt['status'] not in ('starting','running'):
+                raise ACError(6,'attempt_not_starting')
+            now=utc()
+            lease_until=utc(seconds)
+            self.s.db.execute(
+                """UPDATE acs_job_attempts SET status='running',started_at=COALESCE(started_at,?),
+                   heartbeat_at=?,lease_until=?,updated_at=? WHERE attempt_id=?""",
+                (now,now,lease_until,now,attempt['attempt_id'])
+            )
+            self.s.db.execute('UPDATE acs_jobs SET lease_until=?,updated_at=? WHERE id=?',(lease_until,now,jid))
+            self.s.event('space_attempt_running',agent,jid,attempt_id=attempt['attempt_id'],lease_seconds=seconds)
+        return attempt['attempt_id']
+
+    def heartbeat(self,jid,agent,token,seconds):
+        self.s.require_agent(agent)
+        if seconds < 1 or seconds > 86400:
+            raise ACError(4,'invalid_lease')
+        with self.s.transaction():
+            row=self._get_job(jid)
+            attempt=self._attempt_for_claim(row,agent,token)
+            if attempt['status'] not in ('starting','running','cancel_requested'):
+                raise ACError(6,'attempt_not_active')
+            if attempt['lease_until'] and attempt['lease_until'] <= utc():
+                raise ACError(6,'lease_expired_requires_recovery')
+            now=utc()
+            lease_until=utc(seconds)
+            self.s.db.execute(
+                'UPDATE acs_job_attempts SET heartbeat_at=?,lease_until=?,updated_at=? WHERE attempt_id=?',
+                (now,lease_until,now,attempt['attempt_id'])
+            )
+            self.s.db.execute('UPDATE acs_jobs SET lease_until=?,updated_at=? WHERE id=?',(lease_until,now,jid))
+            self.s.event('space_attempt_heartbeat',agent,jid,attempt_id=attempt['attempt_id'],lease_seconds=seconds)
+        return lease_until
+
+    def cancel(self,jid,actor):
+        self.s.require_agent(actor)
+        with self.s.transaction():
+            row=self._get_job(jid)
+            if row['status']=='cancelled':
+                return 'cancelled'
+            if row['status'] in ('open','blocked'):
+                if actor!=row['requester']:
+                    raise ACError(6,'cancel_requires_requester')
+                self.s.db.execute("UPDATE acs_jobs SET status='cancelled',updated_at=? WHERE id=?",(utc(),jid))
+                self.s.event('space_job_cancelled',actor,jid,immediate=True)
+                return 'cancelled'
+            if row['status']!='claimed':
+                raise ACError(6,'job_not_cancellable')
+            if actor not in (row['requester'],row['owner']):
+                raise ACError(6,'cancel_requires_requester_or_owner')
+            attempt=self._attempt_for_claim(row,row['owner'],row['claim_token'])
+            if attempt['status']=='cancel_requested':
+                return 'cancel_requested'
+            if attempt['status'] not in ('claimed','starting','running','recovery_required'):
+                raise ACError(6,'attempt_not_active')
+            now=utc()
+            self.s.db.execute(
+                "UPDATE acs_job_attempts SET status='cancel_requested',updated_at=? WHERE attempt_id=?",
+                (now,attempt['attempt_id'])
+            )
+            self.s.event('space_job_cancel_requested',actor,jid,attempt_id=attempt['attempt_id'],owner=row['owner'])
+        return 'cancel_requested'
+
+    def finish(self,jid,agent,token,result,artifact=None,exit_code=None,error=None):
+        self.s.require_agent(agent)
+        if result not in ('succeeded','failed','interrupted','start_failed','cancelled'):
+            raise ACError(4,'invalid_attempt_result')
+        artifact_ref,sha=self._artifact(artifact)
+        with self.s.transaction():
+            row=self._get_job(jid)
+            attempt=self._attempt_for_claim(row,agent,token)
+            state=attempt['status']
+            if result=='succeeded' and state not in ('claimed','starting','running'):
+                raise ACError(6,'attempt_cannot_succeed_from_state')
+            if result=='start_failed' and state not in ('claimed','starting'):
+                raise ACError(6,'attempt_cannot_start_fail_from_state')
+            if result=='cancelled' and state!='cancel_requested':
+                raise ACError(6,'cancellation_was_not_requested')
+            if result in ('failed','interrupted') and state not in ('claimed','starting','running','cancel_requested','recovery_required'):
+                raise ACError(6,'attempt_not_active')
+            now=utc()
+            self.s.db.execute(
+                """UPDATE acs_job_attempts SET status=?,finished_at=?,updated_at=?,exit_code=?,
+                   artifact=?,sha256=?,error=? WHERE attempt_id=?""",
+                (result,now,now,exit_code,artifact_ref,sha,error,attempt['attempt_id'])
+            )
+            if result=='succeeded':
+                self.s.db.execute(
+                    """UPDATE acs_jobs SET status='submitted',artifact=?,sha256=?,claim_token=NULL,
+                       lease_until=NULL,updated_at=? WHERE id=?""",(artifact_ref,sha,now,jid)
+                )
+            elif result=='cancelled':
+                self.s.db.execute(
+                    """UPDATE acs_jobs SET status='cancelled',owner=NULL,claim_token=NULL,
+                       lease_until=NULL,updated_at=? WHERE id=?""",(now,jid)
+                )
+            else:
+                # A confirmed terminal failure releases the job for another voluntary claimant.
+                self.s.db.execute(
+                    """UPDATE acs_jobs SET status='open',owner=NULL,claim_token=NULL,
+                       lease_until=NULL,updated_at=? WHERE id=?""",(now,jid)
+                )
+            self.s.event('space_attempt_finished',agent,jid,attempt_id=attempt['attempt_id'],
+                         result=result,exit_code=exit_code,artifact=artifact_ref,sha256=sha,error=error)
+            if result=='succeeded':
+                self.s.event('space_job_submitted',agent,jid,attempt_id=attempt['attempt_id'],
+                             artifact=artifact_ref,sha256=sha)
+        return 'submitted' if result=='succeeded' else ('cancelled' if result=='cancelled' else 'open')
+
+    def submit(self,jid,agent,token,artifact=None):
+        # Backward-compatible shorthand: claim -> submit is treated as a successful
+        # one-shot execution. New integrations should use start/running/finish.
+        self.s.require_agent(agent)
+        artifact_ref,sha=self._artifact(artifact)
+        with self.s.transaction():
+            row=self._get_job(jid)
+            attempt=self._attempt_for_claim(row,agent,token)
+            if row['lease_until'] <= utc():
+                raise ACError(6,'claim_expired_requires_recovery')
+            if attempt['status'] not in ('claimed','starting','running'):
+                raise ACError(6,'attempt_not_submittable')
+            now=utc()
+            self.s.db.execute(
+                """UPDATE acs_job_attempts SET status='succeeded',started_at=COALESCE(started_at,?),
+                   finished_at=?,heartbeat_at=?,updated_at=?,artifact=?,sha256=? WHERE attempt_id=?""",
+                (now,now,now,now,artifact_ref,sha,attempt['attempt_id'])
+            )
+            self.s.db.execute(
+                """UPDATE acs_jobs SET status='submitted',artifact=?,sha256=?,claim_token=NULL,
+                   lease_until=NULL,updated_at=? WHERE id=?""",(artifact_ref,sha,now,jid)
+            )
+            self.s.event('space_attempt_finished',agent,jid,attempt_id=attempt['attempt_id'],
+                         result='succeeded',compat_submit=True,artifact=artifact_ref,sha256=sha)
+            self.s.event('space_job_submitted',agent,jid,attempt_id=attempt['attempt_id'],
+                         artifact=artifact_ref,sha256=sha)
         return 'submitted'
 
     def accept(self,jid,actor):
@@ -213,6 +518,17 @@ def cli():
     claim=s.add_parser('claim');claim.add_argument('id');claim.add_argument('--agent',required=True);claim.add_argument('--lease',type=int,default=3600)
     submit=s.add_parser('submit');submit.add_argument('id');submit.add_argument('--agent',required=True);submit.add_argument('--token',required=True);submit.add_argument('--artifact')
     accept=s.add_parser('accept');accept.add_argument('id');accept.add_argument('--agent',required=True)
+    start=s.add_parser('start');start.add_argument('id');start.add_argument('--agent',required=True);start.add_argument('--token',required=True)
+    start.add_argument('--executor',default='native');start.add_argument('--runtime',default='native');start.add_argument('--session');start.add_argument('--pid',type=int)
+    running=s.add_parser('running');running.add_argument('id');running.add_argument('--agent',required=True);running.add_argument('--token',required=True);running.add_argument('--lease',type=int,default=3600)
+    hb=s.add_parser('heartbeat');hb.add_argument('id');hb.add_argument('--agent',required=True);hb.add_argument('--token',required=True);hb.add_argument('--lease',type=int,default=3600)
+    cancel=s.add_parser('cancel');cancel.add_argument('id');cancel.add_argument('--agent',required=True)
+    finish=s.add_parser('finish');finish.add_argument('id');finish.add_argument('--agent',required=True);finish.add_argument('--token',required=True)
+    finish.add_argument('--result',choices=('succeeded','failed','interrupted','start_failed','cancelled'),required=True)
+    finish.add_argument('--artifact');finish.add_argument('--exit-code',type=int);finish.add_argument('--error')
+    recover=s.add_parser('recover');recover.add_argument('id');recover.add_argument('--agent',required=True)
+    recover.add_argument('--action',choices=('resume','requeue','cancel'),required=True);recover.add_argument('--lease',type=int,default=3600)
+    recover.add_argument('--confirmed-stopped',action='store_true')
     s.add_parser('discover')
     args=p.parse_args()
     try:
@@ -241,8 +557,17 @@ def cli():
                 print('CLAIMED',args.id,space.claim(args.id,args.agent,args.lease))
             elif args.command=='submit':print('SUBMITTED',args.id,space.submit(args.id,args.agent,args.token,args.artifact))
             elif args.command=='accept':print('ACCEPTED',args.id,'OPENED',','.join(space.accept(args.id,args.agent)) or 'none')
+            elif args.command=='start':print('STARTING',args.id,space.start(args.id,args.agent,args.token,args.executor,args.runtime,args.session,args.pid))
+            elif args.command=='running':print('RUNNING',args.id,space.running(args.id,args.agent,args.token,args.lease))
+            elif args.command=='heartbeat':print('HEARTBEAT',args.id,space.heartbeat(args.id,args.agent,args.token,args.lease))
+            elif args.command=='cancel':print('CANCEL',args.id,space.cancel(args.id,args.agent))
+            elif args.command=='finish':print('FINISHED',args.id,space.finish(args.id,args.agent,args.token,args.result,args.artifact,args.exit_code,args.error))
+            elif args.command=='recover':print('RECOVERED',args.id,args.action,space.recover(args.id,args.agent,args.action,args.lease,args.confirmed_stopped))
             elif args.command=='discover':
-                print(encoded({'space_version':1,'record_kinds':KINDS,'authorities':AUTHORITIES,'tables':[r[0] for r in store.db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'acs_%' AND type='table' ORDER BY name")], 'protocol':['record','context','post','board','wait-open','job','claim','submit','accept']}))
+                print(encoded({'space_version':2,'record_kinds':KINDS,'authorities':AUTHORITIES,
+                    'execution_states':['claimed','starting','running','cancel_requested','recovery_required','succeeded','failed','interrupted','start_failed','cancelled'],
+                    'tables':[r[0] for r in store.db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'acs_%' AND type='table' ORDER BY name")],
+                    'protocol':['record','context','post','board','wait-open','job','claim','start','running','heartbeat','cancel','finish','recover','submit','accept']}))
         finally:store.close()
         return 0
     except KeyboardInterrupt:
