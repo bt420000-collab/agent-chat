@@ -6,4 +6,6 @@
 
 `test_space.py` 是素体通用项目层独立测试，覆盖用户定义优先级、增量历史、任务依赖、领取、验收与异常拒绝。
 
+`test_execution.py` 覆盖 Job 与 Execution Attempt 分离、启动/运行/心跳/成功交付、失败后重新开放、旧令牌 fencing、取消请求与确认、租约过期显式恢复，以及旧版 claim → submit 兼容路径。执行状态变化复用核心 append-only `events` 事件表。
+
 本地环境的 SQLite 若未修补 WAL-reset 问题，工具会自动使用 SQLite rollback journal，不会冒险强行打开旧版本 WAL 数据库。项目真实部署应在原生 Codex/Antigravity 环境再次验证后台等待恢复，而非仅依赖 CPU 单元测试。
