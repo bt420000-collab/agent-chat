@@ -240,7 +240,7 @@ class Space:
 
     def recover(self,jid,actor,action,seconds=3600,confirmed_stopped=False):
         self.s.require_agent(actor)
-        if action not in ('resume','requeue','cancel'):
+        if action not in ('mark','resume','requeue','cancel'):
             raise ACError(4,'invalid_recovery_action')
         if seconds < 1 or seconds > 86400:
             raise ACError(4,'invalid_lease')
@@ -259,6 +259,15 @@ class Space:
             if not lease or lease>utc():
                 raise ACError(6,'lease_not_expired')
             now=utc()
+            if attempt['status']!='recovery_required':
+                self.s.db.execute(
+                    "UPDATE acs_job_attempts SET status='recovery_required',updated_at=? WHERE attempt_id=?",
+                    (now,attempt['attempt_id'])
+                )
+                self.s.event('space_attempt_recovery_required',actor,jid,attempt_id=attempt['attempt_id'],
+                             expired_lease=lease)
+            if action=='mark':
+                return 'recovery_required'
             if action=='resume':
                 if attempt['status']=='cancel_requested':
                     raise ACError(6,'cancel_requested_attempt_cannot_resume')
@@ -325,6 +334,8 @@ class Space:
         with self.s.transaction():
             row=self._get_job(jid)
             attempt=self._attempt_for_claim(row,agent,token)
+            if attempt['lease_until'] and attempt['lease_until'] <= utc():
+                raise ACError(6,'lease_expired_requires_recovery')
             if attempt['status']=='starting' and attempt['executor_id']==executor_id and attempt['runtime']==runtime:
                 return attempt['attempt_id']
             if attempt['status']!='claimed':
@@ -348,6 +359,8 @@ class Space:
             attempt=self._attempt_for_claim(row,agent,token)
             if attempt['status'] not in ('starting','running'):
                 raise ACError(6,'attempt_not_starting')
+            if attempt['lease_until'] and attempt['lease_until'] <= utc():
+                raise ACError(6,'lease_expired_requires_recovery')
             now=utc()
             lease_until=utc(seconds)
             self.s.db.execute(
@@ -418,13 +431,13 @@ class Space:
             row=self._get_job(jid)
             attempt=self._attempt_for_claim(row,agent,token)
             state=attempt['status']
-            if result=='succeeded' and state not in ('claimed','starting','running'):
+            if result=='succeeded' and state not in ('starting','running'):
                 raise ACError(6,'attempt_cannot_succeed_from_state')
             if result=='start_failed' and state not in ('claimed','starting'):
                 raise ACError(6,'attempt_cannot_start_fail_from_state')
             if result=='cancelled' and state!='cancel_requested':
                 raise ACError(6,'cancellation_was_not_requested')
-            if result in ('failed','interrupted') and state not in ('claimed','starting','running','cancel_requested','recovery_required'):
+            if result in ('failed','interrupted') and state not in ('starting','running','cancel_requested'):
                 raise ACError(6,'attempt_not_active')
             now=utc()
             self.s.db.execute(
@@ -469,7 +482,8 @@ class Space:
                 raise ACError(6,'attempt_not_submittable')
             now=utc()
             self.s.db.execute(
-                """UPDATE acs_job_attempts SET status='succeeded',started_at=COALESCE(started_at,?),
+                """UPDATE acs_job_attempts SET status='succeeded',executor_id=COALESCE(executor_id,'legacy'),
+                   runtime=COALESCE(runtime,'legacy'),started_at=COALESCE(started_at,?),
                    finished_at=?,heartbeat_at=?,updated_at=?,artifact=?,sha256=? WHERE attempt_id=?""",
                 (now,now,now,now,artifact_ref,sha,attempt['attempt_id'])
             )
@@ -527,7 +541,7 @@ def cli():
     finish.add_argument('--result',choices=('succeeded','failed','interrupted','start_failed','cancelled'),required=True)
     finish.add_argument('--artifact');finish.add_argument('--exit-code',type=int);finish.add_argument('--error')
     recover=s.add_parser('recover');recover.add_argument('id');recover.add_argument('--agent',required=True)
-    recover.add_argument('--action',choices=('resume','requeue','cancel'),required=True);recover.add_argument('--lease',type=int,default=3600)
+    recover.add_argument('--action',choices=('mark','resume','requeue','cancel'),required=True);recover.add_argument('--lease',type=int,default=3600)
     recover.add_argument('--confirmed-stopped',action='store_true')
     s.add_parser('discover')
     args=p.parse_args()
