@@ -129,6 +129,22 @@ class ExecutionLifecycleTests(unittest.TestCase):
         self.run_cmd("ac_space.py", "heartbeat", "JOB-1", "--agent", "antigravity",
                      "--token", token, expected=6)
 
+    def test_expired_live_attempt_can_be_resumed_explicitly(self):
+        self.post()
+        token = self.claim()
+        self.run_cmd("ac_space.py", "start", "JOB-1", "--agent", "antigravity", "--token", token)
+        self.run_cmd("ac_space.py", "running", "JOB-1", "--agent", "antigravity", "--token", token)
+        with sqlite3.connect(self.db) as db:
+            db.execute("UPDATE acs_jobs SET lease_until='2000-01-01T00:00:00Z' WHERE id='JOB-1'")
+            db.execute("UPDATE acs_job_attempts SET lease_until='2000-01-01T00:00:00Z' WHERE job_id='JOB-1'")
+        self.run_cmd("ac_space.py", "recover", "JOB-1", "--agent", "codex", "--action", "mark")
+        self.assertEqual(self.job()["active_attempt"]["status"], "recovery_required")
+        self.run_cmd("ac_space.py", "recover", "JOB-1", "--agent", "codex", "--action", "resume", "--lease", 30)
+        self.assertEqual(self.job()["active_attempt"]["status"], "running")
+        self.assertFalse(self.job()["lease_expired"])
+        self.run_cmd("ac_space.py", "finish", "JOB-1", "--agent", "antigravity", "--token", token,
+                     "--result", "succeeded")
+
     def test_legacy_claim_submit_remains_compatible(self):
         self.post()
         token = self.claim()
