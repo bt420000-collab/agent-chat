@@ -268,7 +268,7 @@ class Space:
                 self.s.event('space_attempt_recovery_required',actor,jid,attempt_id=attempt['attempt_id'],
                              expired_lease=lease)
             if action=='mark':
-                return 'recovery_required'
+                return attempt['status'] if attempt['status']=='cancel_requested' else 'recovery_required'
             if action=='resume':
                 if attempt['status']=='cancel_requested':
                     raise ACError(6,'cancel_requested_attempt_cannot_resume')
