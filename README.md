@@ -90,9 +90,9 @@ python ac_space.py accept DEMO-001 --agent <发布者ID>
 
 - `start` 表示执行器开始接手准备；只有确认底层运行时已启动后才调用 `running`。
 - `heartbeat` 由仍在工作的执行器定期调用，续租并留下存活记录。
-- `finish` 的 `succeeded` 会提交成果，但不会直接把 Job 变成 `done`；仍须由发布者验收。 `failed`、`interrupted`、`start_failed` 会结束本次 Attempt 并重新开放 Job，供其他成员自愿认领。
+- `finish` 的 `succeeded` 会提交成果，但不会直接把 Job 变成 `done`；仍须由发布者验收。`failed`、`interrupted`、`start_failed` 会结束本次 Attempt 并重新开放 Job，供其他成员自愿认领；这些终态只能在执行器确认本次运行已经结束后提交。
 - `cancel` 是取消请求，不代表进程已经停止。执行器确认停止后，再用 `finish --result cancelled` 结束 Attempt。
-- 租约过期**不会自动重新开放任务**。先用 `recover --action mark` 标记需要核查；确认原执行仍活着可 `recover --action resume`，确认进程已经停止才可用 `recover --action requeue --confirmed-stopped` 或 `recover --action cancel --confirmed-stopped`。这是为了避免旧进程仍在改文件时，另一个 Agent 又领取同一任务。
+- 租约过期**不会自动重新开放任务**。可先用 `recover --action mark` 留下待核查状态；确认原执行仍活着可 `recover --action resume`，确认进程已经停止才可用 `recover --action requeue --confirmed-stopped` 或 `recover --action cancel --confirmed-stopped`（后两者也可在一次事务中完成标记与恢复）。这是为了避免旧进程仍在改文件时，另一个 Agent 又领取同一任务。
 - 原有 `claim → submit` 简写仍兼容；它会被记录为一次简化的成功 Attempt。新执行器建议使用完整生命周期命令。
 
 `job <ID>` 会返回任务详情、全部 Attempt 历史及当前执行状态。Attempt 的状态变化继续写入 AC 既有的只追加 `events` 事件表；数据库只记录进程信息，不负责替 Agent 启动或杀死外部进程。
@@ -123,6 +123,6 @@ python ac_space.py context --since 2
 
 ## 当前验证
 
-在本包独立测试中，原通信内核的若干核心操作、通用记忆与任务板用隔离数据库验证；测试日志见 `STATUS.md`。原小说项目报告的 20/20 原生数据库交接与一章返修属于**原项目证据**，不是本可携带素体在任意 Agent 客户端上的兼容性保证。
+GitHub Actions 已在 Python 3.11 上运行完整标准库测试套件，41 项通过，覆盖通信内核、通用项目层与新增执行生命周期。它验证的是数据库协议和 CLI 状态流转，不代表已经完成真实 Codex / Antigravity 运行时的自动启动、托管和跨会话恢复测试。原小说项目报告的 20/20 原生数据库交接属于**原项目证据**，不是本可携带素体在任意 Agent 客户端上的兼容性保证。
 
 **不要急着为 AC 加上每个行业的功能。交付共同语言，让结构随着项目实践自适应生长。**
