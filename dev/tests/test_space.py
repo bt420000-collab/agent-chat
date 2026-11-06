@@ -51,7 +51,8 @@ class SpaceTests(unittest.TestCase):
         self.run_cmd('ac_space.py','post','--file',p2)
         board=json.loads(self.run_cmd('ac_space.py','board'))
         self.assertEqual([x['status'] for x in board],['open','blocked'])
-        claim=self.run_cmd('ac_space.py','claim','T1','--agent','antigravity').split()        self.assertEqual(claim[:2],['CLAIMED','T1'])
+        claim=self.run_cmd('ac_space.py','claim','T1','--agent','antigravity').split()
+        self.assertEqual(claim[:2],['CLAIMED','T1'])
         token=claim[2]
         self.run_cmd('ac_space.py','claim','T1','--agent','other',expected=6)
         out=self.work/'hello.md';out.write_text('hello',encoding='utf-8')
