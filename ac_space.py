@@ -259,11 +259,12 @@ class Space:
             if not lease or lease>utc():
                 raise ACError(6,'lease_not_expired')
             now=utc()
-            if attempt['status']!='recovery_required':
+            if attempt['status'] not in ('recovery_required','cancel_requested'):
                 self.s.db.execute(
                     "UPDATE acs_job_attempts SET status='recovery_required',updated_at=? WHERE attempt_id=?",
                     (now,attempt['attempt_id'])
                 )
+            if attempt['status']!='recovery_required':
                 self.s.event('space_attempt_recovery_required',actor,jid,attempt_id=attempt['attempt_id'],
                              expired_lease=lease)
             if action=='mark':
