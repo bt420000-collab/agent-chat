@@ -431,6 +431,8 @@ class Space:
             row=self._get_job(jid)
             attempt=self._attempt_for_claim(row,agent,token)
             state=attempt['status']
+            if state=='cancel_requested' and result!='cancelled':
+                raise ACError(6,'cancel_requested_attempt_must_finish_cancelled')
             if result=='succeeded' and state not in ('starting','running'):
                 raise ACError(6,'attempt_cannot_succeed_from_state')
             if result=='start_failed' and state not in ('claimed','starting'):
@@ -568,7 +570,9 @@ def cli():
                     time.sleep(min(args.interval,max(0,deadline-time.monotonic())))
             elif args.command=='claim':
                 if args.lease<1 or args.lease>86400:raise ACError(4,'invalid_lease')
-                print('CLAIMED',args.id,space.claim(args.id,args.agent,args.lease))
+                token=space.claim(args.id,args.agent,args.lease)
+                attempt=space.job(args.id)['active_attempt']
+                print('CLAIMED',args.id,token,'ATTEMPT',attempt['attempt_id'])
             elif args.command=='submit':print('SUBMITTED',args.id,space.submit(args.id,args.agent,args.token,args.artifact))
             elif args.command=='accept':print('ACCEPTED',args.id,'OPENED',','.join(space.accept(args.id,args.agent)) or 'none')
             elif args.command=='start':print('STARTING',args.id,space.start(args.id,args.agent,args.token,args.executor,args.runtime,args.session,args.pid))
